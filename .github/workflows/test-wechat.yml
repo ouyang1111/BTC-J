@@ -1,0 +1,34 @@
+name: 测试企业微信连接
+
+on:
+  # 允许手动触发
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v3
+    
+    - name: 设置Python环境
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+    
+    - name: 安装依赖
+      run: |
+        if [ -f "BTC/requirements.txt" ]; then
+          cd BTC
+        fi
+        pip install -r requirements.txt
+    
+    - name: 测试企业微信连接
+      env:
+        WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
+      run: |
+        if [ -f "BTC/test_connection.py" ]; then
+          cd BTC
+        fi
+        python test_connection.py
