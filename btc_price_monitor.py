@@ -413,17 +413,41 @@ def main():
     print("=" * 60)
     print()
     
-    # 主循环
-    try:
-        while True:
+    # 检查是否在GitHub Actions中运行（单次运行模式）
+    is_github_actions = os.getenv('GITHUB_ACTIONS') == 'true'
+    
+    # 调试信息
+    print(f"环境变量 GITHUB_ACTIONS: {os.getenv('GITHUB_ACTIONS')}")
+    print(f"检测到GitHub Actions环境: {is_github_actions}")
+    print()
+    
+    if is_github_actions:
+        # GitHub Actions模式：只运行一次
+        print("=" * 60)
+        print("GitHub Actions模式：执行单次检查")
+        print("=" * 60)
+        try:
             check_price_change_and_alert()
-            print(f"等待 {CHECK_INTERVAL_SECONDS} 秒后继续检查...\n")
-            time.sleep(CHECK_INTERVAL_SECONDS)
-    except KeyboardInterrupt:
-        print("\n程序已停止")
-    except Exception as e:
-        print(f"\n程序运行出错: {e}")
-        raise
+            print("=" * 60)
+            print("✅ 检查完成！程序退出")
+            print("=" * 60)
+        except Exception as e:
+            print(f"\n❌ 程序运行出错: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+    else:
+        # 本地运行模式：持续运行
+        try:
+            while True:
+                check_price_change_and_alert()
+                print(f"等待 {CHECK_INTERVAL_SECONDS} 秒后继续检查...\n")
+                time.sleep(CHECK_INTERVAL_SECONDS)
+        except KeyboardInterrupt:
+            print("\n程序已停止")
+        except Exception as e:
+            print(f"\n程序运行出错: {e}")
+            raise
 
 
 if __name__ == '__main__':
