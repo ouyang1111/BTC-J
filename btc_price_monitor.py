@@ -31,6 +31,25 @@ DAILY_MAX_CHANGE_THRESHOLD = 2000
 BINANCE_API_URL = 'https://api.binance.com/api/v3/ticker/price'
 BINANCE_24H_STATS_URL = 'https://api.binance.com/api/v3/ticker/24hr'
 
+# 币安期货API（用于爆仓监控）
+BINANCE_FUTURES_OPEN_INTEREST_URL = 'https://fapi.binance.com/fapi/v1/openInterest'
+BINANCE_FUTURES_PREMIUM_INDEX_URL = 'https://fapi.binance.com/fapi/v1/premiumIndex'
+BINANCE_FUTURES_24H_STATS_URL = 'https://fapi.binance.com/fapi/v1/ticker/24hr'
+
+# ==================== 爆仓监控配置 ====================
+# 未平仓合约量变化阈值（百分比）
+OPEN_INTEREST_CHANGE_THRESHOLD = 10  # 10%的变化视为异常
+
+# 资金费率阈值（百分比）
+FUNDING_RATE_HIGH_THRESHOLD = 0.1  # 0.1% (1000个基点) 视为异常高
+FUNDING_RATE_LOW_THRESHOLD = -0.1  # -0.1% 视为异常低
+
+# ==================== 快速涨跌监控配置（类似coinglass）====================
+# 快速涨跌检测时间窗口（秒）
+RAPID_CHANGE_TIME_WINDOW = 60  # 1分钟内
+# 快速涨跌阈值（百分比）- 类似coinglass的声音提醒机制
+RAPID_CHANGE_THRESHOLD = 2.0  # 1分钟内涨跌超过2%触发提醒
+
 # ==================== 状态文件路径 ====================
 STATE_FILE = 'btc_price_state.json'
 
@@ -90,6 +109,71 @@ def get_btc_24h_stats() -> Optional[Dict]:
         return None
 
 
+def get_futures_open_interest() -> Optional[float]:
+    """
+    从币安期货API获取BTC未平仓合约量
+    
+    Returns:
+        未平仓合约量（BTC），如果失败返回 None
+    """
+    try:
+        params = {'symbol': 'BTCUSDT'}
+        response = requests.get(BINANCE_FUTURES_OPEN_INTEREST_URL, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        return float(data.get('openInterest', 0))
+    except Exception as e:
+        print(f"获取未平仓合约量失败: {e}")
+        return None
+
+
+def get_futures_funding_rate() -> Optional[Dict]:
+    """
+    从币安期货API获取BTC资金费率
+    
+    Returns:
+        包含资金费率信息的字典，如果失败返回 None
+    """
+    try:
+        params = {'symbol': 'BTCUSDT'}
+        response = requests.get(BINANCE_FUTURES_PREMIUM_INDEX_URL, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        return {
+            'fundingRate': float(data.get('lastFundingRate', 0)) * 100,  # 转换为百分比
+            'nextFundingTime': int(data.get('nextFundingTime', 0)),  # 下次资金费率时间
+        }
+    except Exception as e:
+        print(f"获取资金费率失败: {e}")
+        return None
+
+
+def get_futures_24h_stats() -> Optional[Dict]:
+    """
+    从币安期货API获取BTC 24小时统计数据（包含爆仓相关数据）
+    
+    Returns:
+        包含24小时统计数据的字典，如果失败返回 None
+    """
+    try:
+        params = {'symbol': 'BTCUSDT'}
+        response = requests.get(BINANCE_FUTURES_24H_STATS_URL, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        return {
+            'priceChange': float(data.get('priceChange', 0)),
+            'priceChangePercent': float(data.get('priceChangePercent', 0)),
+            'highPrice': float(data.get('highPrice', 0)),
+            'lowPrice': float(data.get('lowPrice', 0)),
+            'lastPrice': float(data.get('lastPrice', 0)),
+            'volume': float(data.get('volume', 0)),  # 24小时成交量
+            'quoteVolume': float(data.get('quoteVolume', 0)),  # 24小时成交额
+        }
+    except Exception as e:
+        print(f"获取期货24小时统计数据失败: {e}")
+        return None
+
+
 def send_wechat_message(message: str) -> bool:
     """
     通过企业微信机器人发送消息
@@ -143,7 +227,11 @@ def load_state() -> Dict:
         'today_high_time': None,
         'today_low_time': None,
         'last_alert_price': None,  # 上次提醒时的价格
-        'daily_max_change_events': []  # 今日超过2000美元涨跌的事件记录
+        'daily_max_change_events': [],  # 今日超过2000美元涨跌的事件记录
+        'last_open_interest': None,  # 上次未平仓合约量
+        'last_funding_rate': None,  # 上次资金费率
+        'liquidation_alerts': [],  # 今日爆仓提醒记录
+        'price_history': []  # 价格历史记录（用于快速涨跌检测）
     }
 
 
@@ -236,6 +324,149 @@ def format_price_message(current_price: float, price_change: float, price_change
     return message
 
 
+def format_rapid_change_message(current_price: float, price_change_percent: float,
+                                time_window: int, previous_price: float) -> str:
+    """
+    格式化快速涨跌提醒消息（企业微信 Markdown 格式）
+    类似coinglass的声音提醒机制
+    
+    Args:
+        current_price: 当前价格
+        price_change_percent: 价格变化百分比
+        time_window: 时间窗口（秒）
+        previous_price: 之前的价格
+    
+    Returns:
+        格式化后的消息（Markdown格式）
+    """
+    beijing_time = get_beijing_time()
+    
+    if price_change_percent > 0:
+        symbol = "🚀"
+        direction = "快速上涨"
+        risk = "可能引发空头爆仓"
+    else:
+        symbol = "⚡"
+        direction = "快速下跌"
+        risk = "可能引发多头爆仓（插针）"
+    
+    minutes = time_window // 60
+    seconds = time_window % 60
+    if minutes > 0:
+        time_str = f"{minutes}分{seconds}秒"
+    else:
+        time_str = f"{seconds}秒"
+    
+    message = f"""# {symbol} 快速{direction}提醒
+
+**🕐 更新时间（北京时间）:** {beijing_time}
+
+## ⚠️ {time_str}内价格剧烈波动
+
+**变化幅度:** {abs(price_change_percent):.2f}%
+
+**当前价格:** ${current_price:,.2f}
+
+**之前价格:** ${previous_price:,.2f}
+
+**价格变化:** ${abs(current_price - previous_price):,.2f}
+
+**风险提示:** {risk}
+
+⚠️ *类似coinglass插针提醒，请密切关注市场动态*"""
+    
+    message += "\n\n⚠️ *本程序仅用于信息提醒，不做任何交易决策*"
+    
+    return message
+
+
+def format_liquidation_alert_message(current_price: float, open_interest: float, 
+                                    open_interest_change: float, funding_rate: float,
+                                    alert_type: str) -> str:
+    """
+    格式化爆仓提醒消息（企业微信 Markdown 格式）
+    
+    Args:
+        current_price: 当前价格
+        open_interest: 当前未平仓合约量
+        open_interest_change: 未平仓合约量变化百分比
+        funding_rate: 资金费率（百分比）
+        alert_type: 提醒类型（'open_interest' 或 'funding_rate'）
+    
+    Returns:
+        格式化后的消息（Markdown格式）
+    """
+    beijing_time = get_beijing_time()
+    
+    if alert_type == 'open_interest':
+        if open_interest_change > 0:
+            symbol = "📈"
+            direction = "增加"
+            risk = "可能预示大量新开仓，市场情绪极端"
+        else:
+            symbol = "📉"
+            direction = "减少"
+            risk = "可能预示大量平仓或爆仓"
+        
+        message = f"""# {symbol} 爆仓风险提醒
+
+**🕐 更新时间（北京时间）:** {beijing_time}
+
+## ⚠️ 未平仓合约量异常变化
+
+**变化幅度:** {direction} {abs(open_interest_change):.2f}%
+
+**当前未平仓合约量:** {open_interest:,.2f} BT
+
+**当前价格:** ${current_price:,.2f}
+
+**风险提示:** {risk}
+
+## 📊 资金费率
+**当前资金费率:** {funding_rate:+.4f}%"""
+    
+    elif alert_type == 'funding_rate':
+        if funding_rate > 0:
+            symbol = "📈"
+            direction = "异常高"
+            risk = "多头需支付高额费用，可能引发平仓"
+        else:
+            symbol = "📉"
+            direction = "异常低"
+            risk = "空头需支付高额费用，可能引发平仓"
+        
+        message = f"""# {symbol} 资金费率异常提醒
+
+**🕐 更新时间（北京时间）:** {beijing_time}
+
+## ⚠️ 资金费率{direction}
+
+**当前资金费率:** {funding_rate:+.4f}%
+
+**当前价格:** ${current_price:,.2f}
+
+**当前未平仓合约量:** {open_interest:,.2f} BT
+
+**风险提示:** {risk}
+
+⚠️ *资金费率异常通常预示着市场情绪极端，可能引发大规模爆仓*"""
+    
+    else:
+        message = f"""# ⚠️ 爆仓风险提醒
+
+**🕐 更新时间（北京时间）:** {beijing_time}
+
+**当前价格:** ${current_price:,.2f}
+
+**当前未平仓合约量:** {open_interest:,.2f} BT
+
+**当前资金费率:** {funding_rate:+.4f}%"""
+    
+    message += "\n\n⚠️ *本程序仅用于信息提醒，不做任何交易决策*"
+    
+    return message
+
+
 def check_price_change_and_alert():
     """检查价格变化并发送提醒"""
     # 加载状态
@@ -248,11 +479,16 @@ def check_price_change_and_alert():
     today_low_time = state.get('today_low_time')
     last_alert_price = state.get('last_alert_price')
     daily_max_change_events = state.get('daily_max_change_events', [])
+    last_open_interest = state.get('last_open_interest')
+    last_funding_rate = state.get('last_funding_rate')
+    liquidation_alerts = state.get('liquidation_alerts', [])
+    price_history = state.get('price_history', [])
     
-    # 获取当前日期（北京时间）
+    # 获取当前日期和时间（北京时间）
     beijing_now = get_beijing_datetime()
     current_date = beijing_now.strftime('%Y-%m-%d')
     current_time_str = beijing_now.strftime('%H:%M')
+    current_timestamp = beijing_now.timestamp()
     
     # 如果是新的一天，重置今日数据
     is_new_day = (last_check_date != current_date)
@@ -264,6 +500,8 @@ def check_price_change_and_alert():
         today_low_time = None
         last_alert_price = None
         daily_max_change_events = []
+        liquidation_alerts = []
+        price_history = []  # 新的一天重置价格历史
     
     # 获取当前价格
     current_price = get_btc_price()
@@ -272,6 +510,57 @@ def check_price_change_and_alert():
         return
     
     print(f"[{get_beijing_time()}] 当前BT价格: ${current_price:,.2f}")
+    
+    # ==================== 快速涨跌检测（类似coinglass）====================
+    # 记录当前价格到历史
+    price_history.append({
+        'timestamp': current_timestamp,
+        'price': current_price,
+        'time': current_time_str
+    })
+    
+    # 清理超过时间窗口的历史记录（保留最近5分钟的数据）
+    cutoff_time = current_timestamp - (RAPID_CHANGE_TIME_WINDOW + 300)
+    price_history = [p for p in price_history if p['timestamp'] > cutoff_time]
+    
+    # 检测快速涨跌
+    if len(price_history) >= 2:
+        # 找到时间窗口内的最早价格
+        window_start_time = current_timestamp - RAPID_CHANGE_TIME_WINDOW
+        window_prices = [p for p in price_history if p['timestamp'] >= window_start_time]
+        
+        if len(window_prices) >= 2:
+            oldest_price_in_window = window_prices[0]['price']
+            price_change_percent = ((current_price - oldest_price_in_window) / oldest_price_in_window) * 100
+            abs_change_percent = abs(price_change_percent)
+            
+            if abs_change_percent >= RAPID_CHANGE_THRESHOLD:
+                # 检查是否已经提醒过（避免重复提醒）
+                alert_key = f"rapid_{current_time_str}"
+                if alert_key not in [a.get('key') for a in liquidation_alerts]:
+                    print(f"  ⚡ 检测到快速涨跌: {price_change_percent:+.2f}% ({RAPID_CHANGE_TIME_WINDOW}秒内)")
+                    rapid_message = format_rapid_change_message(
+                        current_price=current_price,
+                        price_change_percent=price_change_percent,
+                        time_window=RAPID_CHANGE_TIME_WINDOW,
+                        previous_price=oldest_price_in_window
+                    )
+                    
+                    success = send_wechat_message(rapid_message)
+                    if success:
+                        print(f"  ✅ 已发送快速涨跌提醒到企业微信")
+                        liquidation_alerts.append({
+                            'key': alert_key,
+                            'type': 'rapid_change',
+                            'time': f"{current_date} {current_time_str}",
+                            'change_percent': price_change_percent
+                        })
+                    else:
+                        print(f"  ❌ 发送快速涨跌提醒失败")
+                else:
+                    print(f"  快速涨跌: {price_change_percent:+.2f}% (已提醒过)")
+            else:
+                print(f"  价格变化: {price_change_percent:+.2f}% ({RAPID_CHANGE_TIME_WINDOW}秒内，正常范围)")
     
     # 更新今日最高最低价
     if today_high is None or current_price > today_high:
@@ -380,6 +669,86 @@ def check_price_change_and_alert():
             price_change = current_price - last_price
             print(f"  价格变化: ${price_change:,.2f} (不在提醒范围内)")
     
+    # ==================== 爆仓风险检测 ====================
+    print(f"\n[爆仓监控] 开始检测爆仓风险...")
+    
+    # 获取未平仓合约量和资金费率
+    open_interest = get_futures_open_interest()
+    funding_data = get_futures_funding_rate()
+    
+    if open_interest is not None and funding_data is not None:
+        funding_rate = funding_data['fundingRate']
+        print(f"  当前未平仓合约量: {open_interest:,.2f} BT")
+        print(f"  当前资金费率: {funding_rate:+.4f}%")
+        
+        # 检测未平仓合约量异常变化
+        if last_open_interest is not None and last_open_interest > 0:
+            open_interest_change = ((open_interest - last_open_interest) / last_open_interest) * 100
+            abs_change = abs(open_interest_change)
+            
+            if abs_change >= OPEN_INTEREST_CHANGE_THRESHOLD:
+                # 检查是否已经提醒过（避免重复提醒）
+                alert_key = f"oi_{current_time_str}"
+                if alert_key not in [a.get('key') for a in liquidation_alerts]:
+                    print(f"  ⚠️ 未平仓合约量异常变化: {open_interest_change:+.2f}%")
+                    liquidation_message = format_liquidation_alert_message(
+                        current_price=current_price,
+                        open_interest=open_interest,
+                        open_interest_change=open_interest_change,
+                        funding_rate=funding_rate,
+                        alert_type='open_interest'
+                    )
+                    
+                    success = send_wechat_message(liquidation_message)
+                    if success:
+                        print(f"  ✅ 已发送爆仓风险提醒到企业微信")
+                        liquidation_alerts.append({
+                            'key': alert_key,
+                            'type': 'open_interest',
+                            'time': f"{current_date} {current_time_str}",
+                            'change': open_interest_change
+                        })
+                    else:
+                        print(f"  ❌ 发送爆仓风险提醒失败")
+                else:
+                    print(f"  未平仓合约量变化: {open_interest_change:+.2f}% (已提醒过)")
+            else:
+                print(f"  未平仓合约量变化: {open_interest_change:+.2f}% (正常范围)")
+        else:
+            print(f"  首次获取未平仓合约量，记录基准值")
+        
+        # 检测资金费率异常
+        if funding_rate >= FUNDING_RATE_HIGH_THRESHOLD or funding_rate <= FUNDING_RATE_LOW_THRESHOLD:
+            # 检查是否已经提醒过（避免重复提醒）
+            alert_key = f"fr_{current_time_str}"
+            if alert_key not in [a.get('key') for a in liquidation_alerts]:
+                print(f"  ⚠️ 资金费率异常: {funding_rate:+.4f}%")
+                liquidation_message = format_liquidation_alert_message(
+                    current_price=current_price,
+                    open_interest=open_interest,
+                    open_interest_change=0,
+                    funding_rate=funding_rate,
+                    alert_type='funding_rate'
+                )
+                
+                success = send_wechat_message(liquidation_message)
+                if success:
+                    print(f"  ✅ 已发送资金费率异常提醒到企业微信")
+                    liquidation_alerts.append({
+                        'key': alert_key,
+                        'type': 'funding_rate',
+                        'time': f"{current_date} {current_time_str}",
+                        'rate': funding_rate
+                    })
+                else:
+                    print(f"  ❌ 发送资金费率异常提醒失败")
+            else:
+                print(f"  资金费率: {funding_rate:+.4f}% (已提醒过)")
+        else:
+            print(f"  资金费率: {funding_rate:+.4f}% (正常范围)")
+    else:
+        print(f"  ⚠️ 获取爆仓监控数据失败，跳过本次检测")
+    
     # 保存状态
     new_state = {
         'last_price': current_price,
@@ -389,7 +758,11 @@ def check_price_change_and_alert():
         'today_high_time': today_high_time,
         'today_low_time': today_low_time,
         'last_alert_price': last_alert_price,
-        'daily_max_change_events': daily_max_change_events
+        'daily_max_change_events': daily_max_change_events,
+        'last_open_interest': open_interest if open_interest is not None else last_open_interest,
+        'last_funding_rate': funding_data['fundingRate'] if funding_data is not None else last_funding_rate,
+        'liquidation_alerts': liquidation_alerts,
+        'price_history': price_history
     }
     save_state(new_state)
 
