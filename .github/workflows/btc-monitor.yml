@@ -1,0 +1,34 @@
+name: BT价格监控
+
+on:
+  # 定时运行：每5分钟运行一次
+  schedule:
+    - cron: '*/5 * * * *'
+  
+  # 允许手动触发
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v3
+    
+    - name: 设置Python环境
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+    
+    - name: 安装依赖
+      run: |
+        cd BTC
+        pip install -r requirements.txt
+    
+    - name: 运行价格监控
+      env:
+        WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
+      run: |
+        cd BTC
+        python btc_price_monitor.py
